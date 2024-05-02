@@ -1,0 +1,475 @@
+---
+title: "Austin Growth Model"
+author: "Adil Belgaumi"
+date: "2024-04-24"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load_packages, message=FALSE, warning=FALSE, results = "hide"}
+if(!require(pacman)){install.packages("pacman"); library(pacman)}
+p_load(tidyverse, sf, raster, knitr, kableExtra, tidycensus, tigris, FNN, caret,
+       yardstick, pscl, plotROC, ggrepel, pROC, grid, gridExtra, viridis, igraph,
+       tmap,rasterVis)
+
+plotTheme <- theme(
+  plot.title =element_text(size=12),
+  plot.subtitle = element_text(size=8),
+  plot.caption = element_text(size = 6),
+  axis.text.x = element_text(size = 10, angle = 45, hjust = 1),
+  axis.text.y = element_text(size = 10),
+  axis.title.y = element_text(size = 10),
+  # Set the entire chart region to blank
+  panel.background=element_blank(),
+  plot.background=element_blank(),
+  #panel.border=element_rect(colour="#F0F0F0"),
+  # Format the grid
+  panel.grid.major=element_line(colour="#D0D0D0",size=.75),
+  axis.ticks=element_blank())
+
+mapTheme <- theme(plot.title =element_text(size=12),
+                  plot.subtitle = element_text(size=8),
+                  plot.caption = element_text(size = 6),
+                  axis.line=element_blank(),
+                  axis.text.x=element_blank(),
+                  axis.text.y=element_blank(),
+                  axis.ticks=element_blank(),
+                  axis.title.x=element_blank(),
+                  axis.title.y=element_blank(),
+                  panel.background=element_blank(),
+                  panel.border=element_blank(),
+                  panel.grid.major=element_line(colour = 'transparent'),
+                  panel.grid.minor=element_blank(),
+                  legend.direction = "vertical", 
+                  legend.position = "right",
+                  plot.margin = margin(1, 1, 1, 1, 'cm'),
+                  legend.key.height = unit(1, "cm"), legend.key.width = unit(0.2, "cm"))
+
+palette2 <- c("#41b6c4","#253494")
+palette4 <- c("#a1dab4","#41b6c4","#2c7fb8","#253494")
+palette5 <- c("#ffffcc","#a1dab4","#41b6c4","#2c7fb8","#253494")
+palette10 <- c("#f7fcf0","#e0f3db","#ccebc5","#a8ddb5","#7bccc4",
+               "#4eb3d3","#2b8cbe","#0868ac","#084081","#f7fcf0")
+```
+
+```{r Functions}
+quintileBreaks <- function(df,variable) {
+    as.character(quantile(df[[variable]],
+                          c(.01,.2,.4,.6,.8),na.rm=T))
+}
+
+#This function can be used to convert a polygon sf to centroids xy coords.
+xyC <- function(aPolygonSF) {
+  as.data.frame(
+    cbind(x=st_coordinates(st_centroid(aPolygonSF))[,1],
+          y=st_coordinates(st_centroid(aPolygonSF))[,2]))
+} 
+
+#this function convert a raster to a data frame so it can be plotted in ggplot
+rast <- function(inRaster) {
+  data.frame(
+    xyFromCell(inRaster, 1:ncell(inRaster)), 
+    value = getValues(inRaster)) }
+```
+
+
+```{r}
+acs_variables <- load_variables(2021, "acs5")
+
+MSAShape <- get_acs(
+  geography = "tract", variables = "B01001_001", state = 48,  geometry = TRUE, 
+                county=c("Hays", "Travis", "Williamson","Bastrop","Caldwell"), year = 2021) %>% 
+  st_transform(crs = 6578) %>%
+  st_union()
+
+pop_2021 <- get_acs(
+  geography = "tract", variables = "B01001_001", state = 48,  geometry = TRUE, 
+                county=c("Hays", "Travis", "Williamson","Bastrop","Caldwell"), year = 2021) %>% 
+  st_transform(crs = 6578) %>%
+  rename(pop_2021 = estimate) %>% 
+  st_buffer(-1)
+
+pop_2011 <- get_acs(
+  geography = "tract", variables = "B01001_001", state = 48,  geometry = TRUE, 
+                county=c("Hays", "Travis", "Williamson","Bastrop","Caldwell"), year = 2011) %>% 
+  st_transform(crs = 6578) %>%
+  rename(pop_2011 = estimate) %>% 
+  st_buffer(-1)
+
+tm_shape(pop_2011) +
+  tm_fill(col = "pop_2011")
+# st_write(pop_2021,dsn = "Data/pop_2021.shp", append = FALSE)
+```
+
+Creating the Fishnet
+```{r}
+Austin_fishnet <- 
+  st_make_grid(MSAShape, 4000) %>%
+  st_sf() %>% 
+  .[pop_2021, , op=st_intersects]
+```
+
+
+```{r Census Data}
+pop_fishnet <-
+  Austin_fishnet %>%
+  rownames_to_column("fishnetID") %>% 
+  mutate(fishnetID = as.numeric(fishnetID)) %>%
+  dplyr::select(fishnetID)
+
+fishnetPop11 <-
+  st_interpolate_aw(pop_2011["pop_2011"], pop_fishnet, extensive=TRUE) %>%
+  as.data.frame(.) %>%
+  rownames_to_column(var = "fishnetID") %>%
+  left_join(pop_fishnet %>%
+              mutate(fishnetID = as.character(fishnetID)),
+            ., by=c("fishnetID"='fishnetID')) %>% 
+  mutate(pop_2011 = replace_na(pop_2011,0)) %>%
+  dplyr::select(pop_2011)
+
+fishnetPop21 <-
+  st_interpolate_aw(pop_2021["pop_2021"], pop_fishnet, extensive=TRUE) %>%
+  as.data.frame(.) %>%
+  rownames_to_column(var = "fishnetID") %>%
+  left_join(pop_fishnet %>%
+              mutate(fishnetID = as.character(fishnetID)),
+            ., by=c("fishnetID"='fishnetID')) %>% 
+  mutate(pop_2010 = replace_na(pop_2021,0)) %>%
+  dplyr::select(pop_2021)
+
+pop_fishnet <- 
+  cbind(fishnetPop11,fishnetPop21) %>%
+  dplyr::select(pop_2011,pop_2021) %>%
+  mutate(pop_Change = pop_2021 - pop_2011)
+
+tmap_arrange(
+   tm_shape(pop_fishnet) +
+     tm_fill(col = "pop_2011", palette = palette5, n = 5, style = "quantile") +
+     tm_layout(legend.position = c("right", "bottom")),
+   tm_shape(pop_fishnet) +
+     tm_fill(col = "pop_2021", palette = palette5, n = 5, style = "quantile") +
+     tm_layout(legend.position = c("right", "bottom")),
+   tm_shape(pop_fishnet) +
+     tm_fill(col = "pop_Change", palette = palette5, n = 5, style = "quantile") +
+     tm_layout(legend.position = c("right", "bottom")),
+   ncol = 2)
+```
+
+
+```{r}
+if(Sys.getenv("USERNAME") == "adgob") {
+  lc_austin_11 <- raster("Data/lc_final/lc_austin_11.tif")
+  lc_austin_21 <- raster("Data/lc_final/lc_austin_21.tif")
+}  else {
+    #put your directory paths here !
+   lc_austin_11 <- raster("")
+   lc_austin_11 <- raster("")
+}
+```
+
+```{r Reclass Matrices}
+devM <- 
+  matrix(c(
+    0,12,0,
+    12,24,1,
+    24,Inf,0),
+  ncol=3, byrow=T)
+
+forestM <- 
+  matrix(c(
+    0,40,0,
+    40,45,1,
+    45,Inf,0),
+    ncol=3, byrow=T
+  )
+
+farmM <- 
+  matrix(c(
+    0,80,0,
+    80,90,1,
+    90,Inf,0),
+    ncol=3, byrow=T
+  )
+
+wetlandM <- 
+  matrix(c(
+    0,89,0,
+    89,100,1,
+    100,Inf,0),
+    ncol=3, byrow=T
+  )
+
+
+oUndevM <- 
+  matrix(c(
+    0,30,0,
+    30,35,1,
+    35,50,0,
+    50,55,1,
+    55,70,0,
+    70,75,1,
+    75,Inf,0),
+    ncol=3, byrow=T
+  )
+
+waterM <- 
+  matrix(c(
+    0,15,1,
+    15,Inf,0),
+    ncol=3, byrow=T
+  )
+
+ClassMatrices <- list(devM,forestM,farmM,wetlandM,oUndevM,waterM)
+ClassNames <- list("dev","forest","farm","wetland","oUndev","water")
+
+```
+
+
+```{r}
+Raster_list2011 <- c()
+Raster_names <- c()
+for (x in 1:length(ClassMatrices)){ 
+  # Reclassify land cover to the desired land cover type
+  data <- reclassify(lc_austin_11, ClassMatrices[[x]])
+  # Aggregate to get fraction of cell with that land type
+  data <- aggregate(data, fact = 40, FUN = mean)
+  # Name the data in the raster x_2011
+  names(data) <- ClassNames[[x]]
+  # Adds the raster to the raster list with the name x_2011_4000
+  Raster_list2011 <- c(Raster_list2011,
+                assign(ClassNames[[x]],data))
+  # Adds the raster layer names to a list for running future code
+  Raster_names <-  c(Raster_names,
+                     ClassNames[[x]])
+}
+
+dev_2021 <- reclassify(lc_austin_21, devM)
+dev_2021_4000 <- aggregate(dev_2021, fact = 40, FUN = mean)
+names(dev_2021_4000) <- "dev_2021"
+Raster_list2011 <- c(Raster_list2011, 
+                     dev_2021_4000)
+Raster_names <-  c(Raster_names,
+                     "dev_2021")
+
+development_change <- dev_2021_4000 - Raster_list2011[[1]] 
+names(development_change) <- "dev_change"
+Raster_list2011 <- c(Raster_list2011, 
+                     development_change)
+Raster_names <-  c(Raster_names,
+                     "dev_change")
+```
+
+
+```{r}
+
+# lc_au_11_2000 <- aggregate(lc_austin_11, fact = 40, FUN= max)
+# lc_au_21_2000 <- aggregate(lc_austin_21, fact = 40, FUN= max)
+# 
+# ggplot() +
+#   geom_raster(data=rast(Raster_list2011[[1]]) %>% na.omit %>% filter(value > 0),
+#               aes(x,y,fill=value)) +
+#   labs(title = "Land Cover, 2011") +
+#   mapTheme +
+#   theme(legend.direction="vertical")
+```
+
+```{r Aggregate Raster to Fishnet Function, warning = FALSE, message = FALSE}
+aggregateRaster <- function(inputRasterList, theFishnet) {
+  #create an empty fishnet with the same dimensions as the input fishnet
+  theseFishnets <- theFishnet %>% dplyr::select()
+  #for each raster in the raster list
+  for (i in inputRasterList) {
+  #create a variable name corresponding to the ith raster
+  varName <- names(i)
+  #convert raster to points as an sf
+    thesePoints <-
+      rasterToPoints(i) %>%
+      as.data.frame() %>%
+      st_as_sf(coords = c("x", "y"), crs = st_crs(theFishnet)) %>%
+      filter(.[[1]] > 0)
+  #aggregate to the fishnet
+    thisFishnet <-
+      aggregate(thesePoints, theFishnet, mean) %>%
+      mutate(!!varName := ifelse(is.na(.[[1]]),0,.[[1]]))
+ #add to the larger fishnet
+    theseFishnets <- cbind(theseFishnets,thisFishnet)
+  }
+  #output all aggregates as one large fishnet
+   return(theseFishnets)
+}
+```
+
+```{r}
+aggregatedRasters <-
+  aggregateRaster(Raster_list2011, Austin_fishnet) %>%
+  dplyr::select(all_of(Raster_names))
+```
+
+```{r}
+aggregatedRasters <- aggregatedRasters %>% 
+  mutate(developed2011 = ifelse(dev > 0.3,1,0),
+         developed2021 = ifelse(dev_2021 > 0.3,1,0),
+         development_change2 = developed2021 - developed2011
+         ,development_change2 = ifelse(development_change2 < 1,
+                                      0,
+                                      1),
+         maj_water = water > 0.5
+         )
+
+aggregatedRasters %>% 
+  group_by(maj_water,developed2011,developed2021) %>% 
+  tally()
+
+
+tm_shape(aggregatedRasters) +
+  tm_fill(col = "developed2011", palette = palette2)
+tm_shape(aggregatedRasters) +
+  tm_fill(col = "developed2021", palette = palette2)
+tm_shape(aggregatedRasters) +
+  tm_fill(col = "development_change2", palette = palette5, n = 5, style = "quantile")
+
+```
+
+
+```{r}
+tmap_arrange(
+  tm_shape(aggregatedRasters) +
+  tm_fill(col = "dev", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")),
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "forest", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")),
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "water", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")),
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "oUndev", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")), 
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "farm", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")), 
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "wetland", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")),
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "dev_change", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")), 
+  tm_shape(aggregatedRasters) +
+    tm_fill(col = "maj_water", palette = palette5, n = 5, style = "quantile") +
+    tm_layout(legend.position = c("right", "bottom")), 
+  ncol = 2)
+```
+
+
+```{r Highway Data load}
+if(Sys.getenv("USERNAME") == "adgob") {
+  MSAHighways <- st_read("Data/TxDOT_Roadways.shp")
+}  else {
+    #put your directory paths here !
+   MSAHighways <- st_read("")
+}
+
+
+MSAHighways <- MSAHighways  %>% 
+  filter(RTE_PRFX %in% c("IH", 
+                         "SH", 
+                         "SA",
+                         "SL",
+                         "UA",
+                         "US",
+                         "TL"
+                         )) %>% 
+  st_transform(st_crs(pop_2021)) %>%  
+  st_zm() %>% 
+  .[pop_2021, , op=st_intersects]
+```
+
+
+```{r Highway Data to Fishnet}
+emptyRaster <- dev_2021_4000
+emptyRaster[] <- NA
+
+highway_raster <- 
+  as(MSAHighways,'Spatial') %>%
+  rasterize(.,emptyRaster)
+
+highway_raster_distance <- distance(highway_raster)
+names(highway_raster_distance) <- "distance_highways"
+
+highwayPoints <-
+  rasterToPoints(highway_raster_distance) %>%
+  as.data.frame() %>%
+  st_as_sf(coords = c("x", "y"), crs = st_crs(Austin_fishnet))
+
+highwayPoints_fishnet <- 
+  aggregate(highwayPoints, Austin_fishnet, mean) %>%
+  mutate(distance_highways = ifelse(is.na(distance_highways),0,distance_highways))
+
+# ggplot() +
+#   geom_point(data=highwayPoints_fishnet, aes(x=xyC(highwayPoints_fishnet)[,1], 
+#                                              y=xyC(highwayPoints_fishnet)[,2], 
+#                  colour=factor(ntile(distance_highways,5))),size=1.5) +
+#   scale_colour_manual(values = palette5,
+#                       labels=substr(quintileBreaks(highwayPoints_fishnet,"distance_highways"),1,8),
+#                       name="Quintile\nBreaks") +
+#   geom_sf(data=MSAHighways, colour = "red") +
+#   labs(title = "Distance to Highways",
+#        subtitle = "As fishnet centroids; Highways visualized in red") +
+#   mapTheme
+
+tm_shape(highwayPoints_fishnet) +
+  tm_fill(col = "distance_highways", palette = palette5, n = 5, style = "quantile")
+```
+
+
+```{r Development Lag Calc}
+nn_function <- function(measureFrom,measureTo,k) {
+  #convert the sf layers to matrices
+  measureFrom_Matrix <-
+    as.matrix(measureFrom)
+  measureTo_Matrix <-
+    as.matrix(measureTo)
+  nn <-   
+    get.knnx(measureTo, measureFrom, k)$nn.dist
+    output <-
+    as.data.frame(nn) %>%
+    rownames_to_column(var = "thisPoint") %>%
+    gather(points, point_distance, V1:ncol(.)) %>%
+    arrange(as.numeric(thisPoint)) %>%
+    group_by(thisPoint) %>%
+    summarize(pointDistance = mean(point_distance)) %>%
+    arrange(as.numeric(thisPoint)) %>% 
+    dplyr::select(-thisPoint) %>%
+    pull()
+  
+  return(output)  
+}
+
+Austin_fishnet$lagDevelopment <-
+    nn_function(xyC(Austin_fishnet),
+                xyC(filter(aggregatedRasters,dev>0.3)),
+                2)
+
+Austin_fishnet$lagMajDevelopment <-
+    nn_function(xyC(Austin_fishnet),
+                xyC(filter(aggregatedRasters,dev>0.8)),
+                2)
+```
+
+## Final Dataset
+
+```{r}
+dat <- 
+  cbind(
+    aggregatedRasters, 
+    st_drop_geometry(highwayPoints_fishnet), 
+    st_drop_geometry(pop_fishnet)) %>%
+  filter(maj_water == FALSE) 
+
+tm_shape(dat) +
+  tm_fill(col = "developed2011", palette = palette2, style = "cat")
+```
+
